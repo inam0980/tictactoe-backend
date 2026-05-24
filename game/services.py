@@ -1,0 +1,128 @@
+"""
+Service layer — orchestrates DB writes for a move.
+
+Both REST views (solo games) and WebSocket consumers (multiplayer) call
+into these functions so the win-detection / stats-update logic lives in
+exactly one place.
+"""
+
+from django.db import transaction
+from django.utils import timezone
+
+from .logic import apply_move, check_winner, pick_ai_move
+from .models import Game, GameResult, GameStatus, Move
+
+
+class GameError(Exception):
+    """Raised for player-visible rule violations (not bugs)."""
+
+
+@transaction.atomic
+def record_move(game: Game, user, position: int) -> dict:
+    """Apply `user`'s move to `game`. Returns a state dict for the client.
+
+    For solo (AI) games, also plays the bot's reply move within the same
+    transaction so the client sees both moves in one response.
+    """
+    if game.status == GameStatus.FINISHED:
+        raise GameError("game is already finished")
+
+    # Determine which mark the calling user plays.
+    if user.id == game.player_x_id:
+        my_mark = "X"
+    elif game.player_o_id and user.id == game.player_o_id:
+        my_mark = "O"
+    else:
+        raise GameError("you are not a player in this game")
+
+    if game.turn != my_mark:
+        raise GameError("not your turn")
+
+    _play(game, user, position, my_mark)
+
+    # If it's a solo game and game is still active, AI replies immediately.
+    if game.is_solo and game.status == GameStatus.ACTIVE:
+        ai_mark = "O" if my_mark == "X" else "X"
+        ai_pos = pick_ai_move(game.board_state, ai_mark, game.mode)
+        _play(game, None, ai_pos, ai_mark)
+
+    return serialize_game_state(game)
+
+
+def _play(game: Game, player, position: int, mark: str) -> None:
+    """Apply one move (human or AI) and persist + check for end."""
+    try:
+        new_board = apply_move(game.board_state, position, mark)
+    except ValueError as e:
+        raise GameError(str(e))
+
+    game.board_state = new_board
+    if game.started_at is None:
+        game.started_at = timezone.now()
+
+    move_number = game.moves.count() + 1
+    Move.objects.create(
+        game=game, player=player, mark=mark,
+        position=position, move_number=move_number,
+    )
+
+    outcome = check_winner(new_board)
+    if outcome is None:
+        # Game continues — flip turn.
+        game.turn = "O" if mark == "X" else "X"
+        game.status = GameStatus.ACTIVE
+        game.save()
+        return
+
+    # Game ended this move.
+    game.status = GameStatus.FINISHED
+    game.ended_at = timezone.now()
+    if outcome == "draw":
+        game.result = GameResult.DRAW
+        game.winner = None
+    else:
+        game.result = GameResult.X_WON if outcome == "X" else GameResult.O_WON
+        game.winner = game.player_x if outcome == "X" else game.player_o
+    game.save()
+
+    _update_stats(game)
+
+
+def _update_stats(game: Game) -> None:
+    """Bump wins/losses/draws on the player rows. Solo games count too."""
+    px, po = game.player_x, game.player_o
+
+    if game.result == GameResult.DRAW:
+        px.draws += 1
+        px.save(update_fields=["draws"])
+        if po:
+            po.draws += 1
+            po.save(update_fields=["draws"])
+        return
+
+    winner = game.winner
+    loser = po if winner == px else px
+    winner.wins += 1
+    winner.save(update_fields=["wins"])
+    if loser:  # None for solo games where AI "wins"
+        loser.losses += 1
+        loser.save(update_fields=["losses"])
+
+
+def serialize_game_state(game: Game) -> dict:
+    """Compact shape used by both REST responses and WS broadcasts."""
+    return {
+        "id": str(game.id),
+        "mode": game.mode,
+        "status": game.status,
+        "result": game.result,
+        "board": game.board_state,
+        "turn": game.turn,
+        "player_x": _user_brief(game.player_x),
+        "player_o": _user_brief(game.player_o) if game.player_o else None,
+        "winner": _user_brief(game.winner) if game.winner else None,
+    }
+
+
+def _user_brief(user) -> dict:
+    return {"id": user.id, "username": user.username, "avatar_url": user.avatar_url}
