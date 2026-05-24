@@ -4,6 +4,8 @@ REST endpoints for solo games + history + leaderboard + lobby.
 Real-time multiplayer goes through WebSockets (consumers.py), not here.
 """
 
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 from django.utils import timezone
@@ -22,7 +24,14 @@ from .serializers import (
     GameHistoryItemSerializer,
     GameSerializer,
 )
-from .services import GameError, _play, record_move, serialize_game_state
+from .services import (
+    GameError,
+    _play,
+    create_room,
+    join_room,
+    record_move,
+    serialize_game_state,
+)
 
 User = get_user_model()
 
@@ -138,3 +147,51 @@ def heartbeat(request):
     request.user.last_seen = timezone.now()
     request.user.save(update_fields=["last_seen"])
     return Response({"ok": True})
+
+
+class CreateRoomView(APIView):
+    """POST /api/rooms/create/  -> {game_id, room_code} for a new private room."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        try:
+            game = create_room(request.user)
+        except GameError as e:
+            return Response({"detail": str(e)}, status=400)
+        return Response(
+            {"game_id": str(game.id), "room_code": game.room_code},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class JoinRoomView(APIView):
+    """POST /api/rooms/join/  body: {"room_code": "0427"} -> {game_id, your_mark}
+
+    After flipping the game to ACTIVE in the DB, we push a state frame to
+    the game's Channels group so the creator (who is already connected to
+    the GameConsumer waiting) navigates into the game instantly.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        code = request.data.get("room_code", "")
+        try:
+            game = join_room(request.user, code)
+        except GameError as e:
+            return Response({"detail": str(e)}, status=400)
+
+        # Push the new ACTIVE state to anyone listening on this game's group
+        # (the creator's WebSocket). The joiner connects to the same group
+        # right after this response, and GameConsumer.connect sends them
+        # the initial state directly — so we don't need to send to ourselves.
+        channel_layer = get_channel_layer()
+        if channel_layer is not None:
+            async_to_sync(channel_layer.group_send)(
+                f"game_{game.id}",
+                {"type": "broadcast.state", "state": serialize_game_state(game)},
+            )
+
+        return Response(
+            {"game_id": str(game.id), "your_mark": "O"},
+            status=status.HTTP_200_OK,
+        )

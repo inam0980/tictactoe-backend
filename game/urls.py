@@ -1,8 +1,10 @@
 from django.urls import path
 
 from .views import (
+    CreateRoomView,
     GameDetailView,
     GameHistoryView,
+    JoinRoomView,
     LeaderboardView,
     MakeMoveView,
     OnlinePlayersView,
@@ -18,4 +20,6 @@ urlpatterns = [
     path("leaderboard/", LeaderboardView.as_view(), name="leaderboard"),
     path("lobby/online/", OnlinePlayersView.as_view(), name="online_players"),
     path("lobby/heartbeat/", heartbeat, name="heartbeat"),
+    path("rooms/create/", CreateRoomView.as_view(), name="create_room"),
+    path("rooms/join/", JoinRoomView.as_view(), name="join_room"),
 ]

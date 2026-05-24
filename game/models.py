@@ -76,6 +76,14 @@ class Game(models.Model):
     # Whose turn ("X" or "O"). X always starts.
     turn = models.CharField(max_length=1, default="X")
 
+    # 4-digit code for private rooms ("Create Room" flow). Null for
+    # solo/AI games and random-matchmade games. Stored as a string so
+    # leading zeros are preserved (e.g. "0427"). Uniqueness is enforced
+    # only among status=waiting rows at creation time, not at DB level.
+    room_code = models.CharField(
+        max_length=4, null=True, blank=True, db_index=True
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)

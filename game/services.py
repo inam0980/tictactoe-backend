@@ -6,11 +6,13 @@ into these functions so the win-detection / stats-update logic lives in
 exactly one place.
 """
 
+import secrets
+
 from django.db import transaction
 from django.utils import timezone
 
 from .logic import apply_move, check_winner, pick_ai_move
-from .models import Game, GameResult, GameStatus, Move
+from .models import Game, GameMode, GameResult, GameStatus, Move
 
 
 class GameError(Exception):
@@ -126,3 +128,63 @@ def serialize_game_state(game: Game) -> dict:
 
 def _user_brief(user) -> dict:
     return {"id": user.id, "username": user.username, "avatar_url": user.avatar_url}
+
+
+# --- Private room (4-digit code) flow ---
+
+_ROOM_CODE_TRIES = 8  # 10k codes, very few active at once → collisions are rare.
+
+
+def _generate_room_code() -> str:
+    """Cryptographically random 4-digit string, zero-padded ("0427")."""
+    return f"{secrets.randbelow(10000):04d}"
+
+
+@transaction.atomic
+def create_room(user) -> Game:
+    """Create a WAITING multiplayer game with a unique 4-digit room_code.
+
+    Uniqueness is enforced only among currently-WAITING games. Finished
+    games may share a code with a new room — that's fine because the
+    join lookup filters by status.
+    """
+    for _ in range(_ROOM_CODE_TRIES):
+        code = _generate_room_code()
+        taken = Game.objects.filter(
+            room_code=code, status=GameStatus.WAITING
+        ).exists()
+        if not taken:
+            return Game.objects.create(
+                mode=GameMode.MULTIPLAYER,
+                status=GameStatus.WAITING,
+                player_x=user,
+                room_code=code,
+            )
+    # Astronomically unlikely with <100 concurrent rooms.
+    raise GameError("could not allocate a unique room code, try again")
+
+
+@transaction.atomic
+def join_room(user, room_code: str) -> Game:
+    """Find a WAITING room by code and put `user` in the player_o slot."""
+    code = (room_code or "").strip()
+    if not code.isdigit() or len(code) != 4:
+        raise GameError("room code must be 4 digits")
+
+    # select_for_update locks the row so two simultaneous joiners can't
+    # both win the slot.
+    game = (
+        Game.objects.select_for_update()
+        .filter(room_code=code, status=GameStatus.WAITING)
+        .first()
+    )
+    if game is None:
+        raise GameError("room not found or already started")
+    if game.player_x_id == user.id:
+        raise GameError("you can't join your own room")
+
+    game.player_o = user
+    game.status = GameStatus.ACTIVE
+    game.started_at = timezone.now()
+    game.save(update_fields=["player_o", "status", "started_at"])
+    return game
